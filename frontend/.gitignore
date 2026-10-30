@@ -1,0 +1,31 @@
+
+# Python virtual environments
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python cache
+.pytest_cache/
+
+# Backup folders
+backend-backup/
+frontend-backup/
+
+# Database backups
+*.dump
+*.sql
+*.sqlite
+*.db
+
+# Recordings
+*.mp4
+*.mov
+
+# IDE
+.idea/

@@ -1,0 +1,970 @@
+from datetime import date, datetime, timedelta, timezone
+import json
+import os
+
+from fastapi import (
+
+    FastAPI,
+
+    UploadFile,
+
+    File,
+
+    Depends,
+
+    HTTPException,
+
+    Form,
+
+)
+
+from fastapi.middleware.cors import CORSMiddleware
+
+from sqlalchemy.orm import Session
+
+from sqlalchemy import func, Column, Integer, String, Text, DateTime, ForeignKey
+
+from pydantic import BaseModel, Field
+
+from pwdlib import PasswordHash
+from webauthn import (
+    generate_registration_options,
+    verify_registration_response,
+)
+from webauthn.helpers import (
+    options_to_json,
+    base64url_to_bytes,
+    bytes_to_base64url,
+)
+from webauthn.helpers.structs import (
+    AuthenticatorSelectionCriteria,
+    PublicKeyCredentialDescriptor,
+    UserVerificationRequirement,
+)
+
+from database import (
+
+    Base,
+
+    engine,
+
+    SessionLocal,
+
+    Voter,
+
+    Vote,
+
+)
+
+from services.face_recognition_service import (
+
+    get_face_embedding,
+
+    compare_faces,
+
+    embedding_to_json,
+
+    json_to_embedding,
+
+)
+
+app = FastAPI(
+
+    title="AI Blockchain Voting System",
+
+    version="1.1.0",
+
+)
+
+class PasskeyChallenge(Base):
+    __tablename__ = "passkey_challenges"
+
+    id = Column(Integer, primary_key=True, index=True)
+    voter_id = Column(Integer, ForeignKey("voters.id"), unique=True, nullable=False, index=True)
+    challenge = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
+Base.metadata.create_all(bind=engine)
+
+password_hash = PasswordHash.recommended()
+
+MINIMUM_VOTING_AGE = 18
+
+# Demo candidate data. Replace with a database-backed candidate table later.
+
+CANDIDATES = {
+
+    1: {"id": 1, "name": "Candidate A", "party": "Party A"},
+
+    2: {"id": 2, "name": "Candidate B", "party": "Party B"},
+
+    3: {"id": 3, "name": "Candidate C", "party": "Party C"},
+
+}
+
+def get_db():
+
+    db = SessionLocal()
+
+    try:
+
+        yield db
+
+    finally:
+
+        db.close()
+
+app.add_middleware(
+
+    CORSMiddleware,
+
+    allow_origins=[
+
+        "http://localhost:5173",
+
+        "http://127.0.0.1:5173",
+
+    ],
+
+    allow_credentials=True,
+
+    allow_methods=["*"],
+
+    allow_headers=["*"],
+
+)
+
+class LoginRequest(BaseModel):
+
+    email: str
+
+    password: str
+
+class VoteRequest(BaseModel):
+
+    voter_id: int
+
+    candidate_id: int
+
+def calculate_age(dob: date) -> int:
+
+    today = date.today()
+
+    return (
+
+        today.year
+
+        - dob.year
+
+        - ((today.month, today.day) < (dob.month, dob.day))
+
+    )
+
+def validate_face_image(image_bytes: bytes):
+
+    if not image_bytes:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail="No face image received.",
+
+        )
+
+    embedding = get_face_embedding(image_bytes)
+
+    if embedding is None:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail=(
+
+                "Face registration failed. Make sure exactly one "
+
+                "clear face is visible."
+
+            ),
+
+        )
+
+    return embedding
+
+@app.get("/")
+
+def root():
+
+    return {"message": "AI Blockchain Voting System API is running"}
+
+@app.get("/api/health")
+
+def health():
+
+    return {"status": "ok"}
+
+# =========================================================
+
+# REGISTER VOTER + FACE
+
+# =========================================================
+
+@app.post("/api/register")
+
+async def register(
+
+    name: str = Form(...),
+
+    voter_number: str = Form(...),
+
+    dob: date = Form(...),
+
+    email: str | None = Form(None),
+
+    password: str | None = Form(None),
+
+    file: UploadFile = File(...),
+
+    db: Session = Depends(get_db),
+
+):
+
+    name = name.strip()
+
+    voter_number = voter_number.strip()
+
+    email = email.strip().lower() if email and email.strip() else None
+
+    password = password if password else None
+
+    if not name or not voter_number:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail="Name and voter number are required.",
+
+        )
+
+    if dob > date.today():
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail="Date of birth cannot be in the future.",
+
+        )
+
+    if email:
+
+        existing_email = (
+
+            db.query(Voter)
+
+            .filter(Voter.email == email)
+
+            .first()
+
+        )
+
+        if existing_email:
+
+            raise HTTPException(
+
+                status_code=400,
+
+                detail="Email is already registered.",
+
+            )
+
+    if password and len(password) < 8:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail="If supplied, password must have at least 8 characters.",
+
+        )
+
+    existing_voter = (
+
+        db.query(Voter)
+
+        .filter(Voter.voter_number == voter_number)
+
+        .first()
+
+    )
+
+    if existing_voter:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail="Voter number is already registered.",
+
+        )
+
+    # This validates the entered DOB only. It is not official identity
+
+    # verification or a connection to Aadhaar/UIDAI.
+
+    age = calculate_age(dob)
+
+    eligible_by_age = age >= MINIMUM_VOTING_AGE
+
+    image_bytes = await file.read()
+
+    embedding = validate_face_image(image_bytes)
+
+    hashed_password = (
+
+        password_hash.hash(password) if password else None
+
+    )
+
+    voter = Voter(
+
+        name=name,
+
+        voter_number=voter_number,
+
+        dob=dob,
+
+        email=email,
+
+        password_hash=hashed_password,
+
+        is_eligible=eligible_by_age,
+
+        has_voted=False,
+
+        face_embedding=embedding_to_json(embedding),
+
+    )
+
+    try:
+
+        db.add(voter)
+
+        db.commit()
+
+        db.refresh(voter)
+
+    except Exception as error:
+
+        db.rollback()
+
+        print("REGISTRATION ERROR:", str(error))
+
+        raise HTTPException(
+
+            status_code=500,
+
+            detail="Registration failed. Check the database logs.",
+
+        )
+
+    return {
+
+        "success": True,
+
+        "message": "Voter and face registration successful.",
+
+        "voter_id": voter.id,
+
+        "age_eligible": eligible_by_age,
+
+        "email_login_available": bool(email and hashed_password),
+
+        "passkey_setup_required": True,
+
+    }
+
+# =========================================================
+
+# PASSWORD LOGIN
+
+# =========================================================
+
+@app.post("/api/login")
+
+def login(
+
+    data: LoginRequest,
+
+    db: Session = Depends(get_db),
+
+):
+
+    email = data.email.strip().lower()
+
+    voter = (
+
+        db.query(Voter)
+
+        .filter(Voter.email == email)
+
+        .first()
+
+    )
+
+    if (
+
+        not voter
+
+        or not voter.password_hash
+
+        or not password_hash.verify(
+
+            data.password,
+
+            voter.password_hash,
+
+        )
+
+    ):
+
+        raise HTTPException(
+
+            status_code=401,
+
+            detail="Invalid email or password, or no password login is enrolled.",
+
+        )
+
+    return {
+
+        "success": True,
+
+        "message": "Login successful.",
+
+        "voter_id": voter.id,
+
+        "name": voter.name,
+
+        "email": voter.email,
+
+    }
+
+# =========================================================
+
+# ELIGIBILITY
+
+# =========================================================
+
+@app.post("/api/eligibility")
+
+def check_eligibility(
+
+    voter_id: int,
+
+    db: Session = Depends(get_db),
+
+):
+
+    voter = (
+
+        db.query(Voter)
+
+        .filter(Voter.id == voter_id)
+
+        .first()
+
+    )
+
+    if not voter:
+
+        return {
+
+            "success": False,
+
+            "eligible": False,
+
+            "message": "Voter account not found.",
+
+        }
+
+    if voter.dob is None:
+
+        return {
+
+            "success": True,
+
+            "eligible": False,
+
+            "message": "Date of birth is missing.",
+
+        }
+
+    if calculate_age(voter.dob) < MINIMUM_VOTING_AGE:
+
+        voter.is_eligible = False
+
+        db.commit()
+
+        return {
+
+            "success": True,
+
+            "eligible": False,
+
+            "message": "The minimum voting age requirement is not met.",
+
+        }
+
+    if voter.has_voted:
+
+        return {
+
+            "success": True,
+
+            "eligible": False,
+
+            "message": "You have already voted.",
+
+        }
+
+    # This is prototype eligibility based on the stored DOB.
+
+    # Official eligibility requires authoritative verification.
+
+    voter.is_eligible = True
+
+    db.commit()
+
+    return {
+
+        "success": True,
+
+        "eligible": True,
+
+        "message": "Age requirement passed in this prototype.",
+
+        "voter_id": voter.id,
+
+    }
+
+# =========================================================
+
+# SUBMIT VOTE
+
+# =========================================================
+
+@app.post("/api/vote")
+
+def submit_vote(
+
+    data: VoteRequest,
+
+    db: Session = Depends(get_db),
+
+):
+
+    try:
+
+        # Lock the voter row to reduce concurrent duplicate submissions.
+
+        voter = (
+
+            db.query(Voter)
+
+            .filter(Voter.id == data.voter_id)
+
+            .with_for_update()
+
+            .first()
+
+        )
+
+        if not voter:
+
+            raise HTTPException(
+
+                status_code=404,
+
+                detail="Voter account not found.",
+
+            )
+
+        if voter.dob is None:
+
+            raise HTTPException(
+
+                status_code=403,
+
+                detail="Date of birth is missing.",
+
+            )
+
+        if calculate_age(voter.dob) < MINIMUM_VOTING_AGE:
+
+            raise HTTPException(
+
+                status_code=403,
+
+                detail="Minimum voting age requirement is not met.",
+
+            )
+
+        if not voter.is_eligible:
+
+            raise HTTPException(
+
+                status_code=403,
+
+                detail="Voter is not eligible.",
+
+            )
+
+        if voter.has_voted:
+
+            raise HTTPException(
+
+                status_code=409,
+
+                detail="This voter has already voted.",
+
+            )
+
+        if data.candidate_id not in CANDIDATES:
+
+            raise HTTPException(
+
+                status_code=400,
+
+                detail="Invalid candidate.",
+
+            )
+
+        existing_vote = (
+
+            db.query(Vote)
+
+            .filter(Vote.voter_id == voter.id)
+
+            .first()
+
+        )
+
+        if existing_vote:
+
+            raise HTTPException(
+
+                status_code=409,
+
+                detail="A vote has already been recorded.",
+
+            )
+
+        vote = Vote(
+
+            voter_id=voter.id,
+
+            candidate_id=data.candidate_id,
+
+        )
+
+        db.add(vote)
+
+        voter.has_voted = True
+
+        db.commit()
+
+        db.refresh(vote)
+
+        return {
+
+            "success": True,
+
+            "message": "Vote submitted successfully.",
+
+            "vote_id": vote.id,
+
+            "candidate_id": vote.candidate_id,
+
+        }
+
+    except HTTPException:
+
+        db.rollback()
+
+        raise
+
+    except Exception as error:
+
+        db.rollback()
+
+        print("VOTE SUBMISSION ERROR:", str(error))
+
+        raise HTTPException(
+
+            status_code=500,
+
+            detail="Vote could not be submitted.",
+
+        )
+
+# =========================================================
+
+# ELECTION RESULTS
+
+# =========================================================
+
+@app.get("/api/results")
+
+def get_results(
+
+    db: Session = Depends(get_db),
+
+):
+
+    vote_counts = (
+
+        db.query(
+
+            Vote.candidate_id,
+
+            func.count(Vote.id).label("vote_count"),
+
+        )
+
+        .group_by(Vote.candidate_id)
+
+        .all()
+
+    )
+
+    counts = {candidate_id: 0 for candidate_id in CANDIDATES}
+
+    for candidate_id, vote_count in vote_counts:
+
+        if candidate_id in counts:
+
+            counts[candidate_id] = vote_count
+
+    candidates = [
+
+        {
+
+            **candidate,
+
+            "votes": counts[candidate_id],
+
+        }
+
+        for candidate_id, candidate in CANDIDATES.items()
+
+    ]
+
+    return {
+
+        "success": True,
+
+        "total_votes": sum(counts.values()),
+
+        "candidates": candidates,
+
+    }
+
+# =========================================================
+
+# REGISTER FACE FOR AN EXISTING VOTER
+
+# =========================================================
+
+@app.post("/api/register-face")
+
+async def register_face(
+
+    voter_id: int = Form(...),
+
+    file: UploadFile = File(...),
+
+    db: Session = Depends(get_db),
+
+):
+
+    voter = (
+
+        db.query(Voter)
+
+        .filter(Voter.id == voter_id)
+
+        .first()
+
+    )
+
+    if not voter:
+
+        raise HTTPException(
+
+            status_code=404,
+
+            detail="Voter account not found.",
+
+        )
+
+    image_bytes = await file.read()
+
+    embedding = validate_face_image(image_bytes)
+
+    try:
+
+        voter.face_embedding = embedding_to_json(embedding)
+
+        db.commit()
+
+        return {
+
+            "success": True,
+
+            "message": "Face registered successfully.",
+
+            "voter_id": voter.id,
+
+        }
+
+    except Exception as error:
+
+        db.rollback()
+
+        print("FACE REGISTRATION ERROR:", str(error))
+
+        raise HTTPException(
+
+            status_code=500,
+
+            detail="Face registration failed.",
+
+        )
+
+# =========================================================
+
+# FACE VERIFICATION
+
+# =========================================================
+
+@app.post("/api/face-verification")
+
+async def face_verification(
+
+    voter_id: int = Form(...),
+
+    file: UploadFile = File(...),
+
+    db: Session = Depends(get_db),
+
+):
+
+    voter = (
+
+        db.query(Voter)
+
+        .filter(Voter.id == voter_id)
+
+        .first()
+
+    )
+
+    if not voter:
+
+        raise HTTPException(
+
+            status_code=404,
+
+            detail="Voter account not found.",
+
+        )
+
+    if not voter.face_embedding:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail="No registered face found for this voter.",
+
+        )
+
+    image_bytes = await file.read()
+
+    live_embedding = validate_face_image(image_bytes)
+
+    try:
+
+        reference_embedding = json_to_embedding(
+
+            voter.face_embedding
+
+        )
+
+        similarity, match = compare_faces(
+
+            reference_embedding,
+
+            live_embedding,
+
+            threshold=0.45,
+
+        )
+
+        print(
+
+            "Face verification:",
+
+            f"voter_id={voter.id}",
+
+            f"similarity={similarity:.4f}",
+
+            f"match={match}",
+
+        )
+
+        if not match:
+
+            return {
+
+                "success": False,
+
+                "verified": False,
+
+                "message": "Face does not match the registered face.",
+
+                "similarity": round(float(similarity), 4),
+
+            }
+
+        return {
+
+            "success": True,
+
+            "verified": True,
+
+            "message": "Face verified successfully.",
+
+            "similarity": round(float(similarity), 4),
+
+        }
+
+    except HTTPException:
+
+        raise
+
+    except Exception as error:
+
+        print("FACE VERIFICATION ERROR:", str(error))
+
+        raise HTTPException(
+
+            status_code=500,
+
+            detail="Face verification failed.",
+
+        )

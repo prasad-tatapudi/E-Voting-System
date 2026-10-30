@@ -1,0 +1,53 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+.venv-1/
+.venv-2/
+.venv-3/
+.venv-4/
+venv/
+backend/venv/
+
+# Node modules
+node_modules/
+
+# Environment variables
+.env
+
+# VS Code
+.vscode/
+
+# Build files
+dist/
+build/
+
+# Project backups
+backend-backup/
+frontend-backup/
+
+# Database backups
+*.dump
+*.sql
+*.db
+*.sqlite
+
+# Recordings
+*.mp4
+*.mov
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+dist/
